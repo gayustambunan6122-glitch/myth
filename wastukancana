@@ -637,66 +637,56 @@ function registerAgent() {
 function sendReport($task_id, $scan_results, $wp_versions = []) {
     global $agent_id;
     
-    $data = [
-        'agent_id' => $agent_id,
-        'task_id' => $task_id,
-        'files_scanned' => $scan_results['files_scanned'],
-        'results' => $scan_results['suspicious'],
-        'wp_versions' => $wp_versions  // TAMBAHKAN INI!
-    ];
+    $all_suspicious = $scan_results['suspicious'];
+    $total = count($all_suspicious);
     
-    $json_data = json_encode($data);
-    $use_compression = function_exists('gzcompress') && strlen($json_data) > 10240;
-    
-    if ($use_compression) {
-        $compressed = gzcompress($json_data, 9);
-        $post_data = [
-            'compressed' => 1,
-            'data' => base64_encode($compressed)
+    if ($total == 0) {
+        $data = [
+            'agent_id' => $agent_id,
+            'task_id' => $task_id,
+            'files_scanned' => $scan_results['files_scanned'],
+            'results' => [],
+            'wp_versions' => $wp_versions
         ];
-        $original = round(strlen($json_data)/1024, 1);
-        $compressed_size = round(strlen($post_data['data'])/1024, 1);
-        echo "<div style='background:#1a1f2e;padding:5px;margin:5px 0;border-left:4px solid #4caf50;'>📦 Compressed: {$original}KB → {$compressed_size}KB (" . round((1 - $compressed_size/$original)*100) . "% smaller)</div>";
-    } else {
-        $post_data = $data;
-        if (!function_exists('gzcompress')) {
-            echo "<div style='background:#ff9800;padding:5px;margin:5px 0;'>⚠️ gzcompress not available, sending uncompressed</div>";
+        return sendSingleReport($data, $task_id);
+    }
+    
+    // Kirim batch 20 file per request
+    $batch_size = 20;
+    $batches = array_chunk($all_suspicious, $batch_size);
+    $results = [];
+    
+    echo "<div style='background:#1a1f2e;padding:10px;margin:10px 0;'>";
+    echo "📡 Sending " . $total . " suspicious files in " . count($batches) . " batches...<br>";
+    
+    foreach ($batches as $i => $batch) {
+        $batch_task_id = $task_id . "_b" . ($i+1);
+        $data = [
+            'agent_id' => $agent_id,
+            'task_id' => $batch_task_id,
+            'files_scanned' => $scan_results['files_scanned'],
+            'results' => $batch,
+            'wp_versions' => $wp_versions
+        ];
+        
+        echo "Batch " . ($i+1) . " (" . count($batch) . " files)... ";
+        $result = sendSingleReport($data, $batch_task_id);
+        
+        if ($result && isset($result['status']) && $result['status'] == 'ok') {
+            echo "✅ OK<br>";
+            $results[] = $result;
+        } else {
+            echo "❌ FAILED<br>";
         }
-    }
-    
-    $url = CENTRAL_SERVER . '?action=agent_report&api_key=' . API_KEY;
-    
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $url);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($post_data));
-    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 120);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    
-    $response = curl_exec($ch);
-    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curl_error = curl_error($ch);
-    curl_close($ch);
-    
-    echo "<div style='background:#1a1f2e;padding:10px;margin:10px 0;border-left:4px solid #4fc3f7;'>";
-    echo "<strong>📡 Report Status:</strong><br>";
-    echo "HTTP Code: " . $http_code . "<br>";
-    if ($curl_error) {
-        echo "<span style='color:#ff5252'>❌ CURL Error: " . $curl_error . "</span><br>";
-    }
-    if ($response) {
-        echo "Response: " . htmlspecialchars(substr($response, 0, 200)) . "<br>";
+        
+        // Jeda 1 detik antar batch
+        sleep(1);
     }
     echo "</div>";
     
-    if ($http_code == 200 && $response) {
-        return json_decode($response, true);
-    }
-    
-    return ['error' => 'Failed to send', 'http_code' => $http_code, 'curl_error' => $curl_error];
+    return ['status' => 'batches_sent', 'total_batches' => count($batches)];
 }
+
 
 
 function sendSingleReport($data, $task_id) {
